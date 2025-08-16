@@ -11,6 +11,11 @@
 (define-constant ERR-NO-SESSIONS-LEFT (err u110))
 (define-constant ERR-INVALID-PLAN (err u111))
 (define-constant ERR-SUBSCRIPTION-EXISTS (err u112))
+(define-constant ERR-ALREADY-RATED (err u113))
+(define-constant ERR-INVALID-RATING (err u114))
+(define-constant ERR-CANNOT-RATE-SELF (err u115))
+(define-constant ERR-SESSION-NOT-COMPLETED (err u116))
+(define-constant ERR-NO-RATING (err u117))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var fee-percentage uint u5)
@@ -67,6 +72,41 @@
 )
 
 (define-data-var next-plan-id uint u1)
+
+(define-map therapist-ratings principal
+  {
+    total-ratings: uint,
+    total-score: uint,
+    average-rating: uint,
+    five-star: uint,
+    four-star: uint,
+    three-star: uint,
+    two-star: uint,
+    one-star: uint
+  }
+)
+
+(define-map session-ratings uint
+  {
+    patient: principal,
+    therapist: principal,
+    rating: uint,
+    review-text: (string-ascii 500),
+    timestamp: uint,
+    therapist-response: (optional (string-ascii 300)),
+    response-timestamp: (optional uint)
+  }
+)
+
+(define-map patient-rating-history principal
+  {
+    total-ratings-given: uint,
+    average-rating-given: uint,
+    last-rating-block: uint
+  }
+)
+
+(define-data-var next-rating-id uint u1)
 
 (define-public (register-therapist (rate uint))
   (let
@@ -404,3 +444,223 @@
     false
   )
 )
+
+(define-public (rate-therapist-session (session-id uint) (rating uint) (review-text (string-ascii 500)))
+  (let
+    (
+      (patient tx-sender)
+      (session (unwrap! (map-get? sessions session-id) ERR-NO-SESSION))
+      (therapist (get therapist session))
+      (rating-id (var-get next-rating-id))
+      (existing-rating (map-get? session-ratings session-id))
+      (therapist-rating-data (default-to 
+        {total-ratings: u0, total-score: u0, average-rating: u0, 
+         five-star: u0, four-star: u0, three-star: u0, two-star: u0, one-star: u0}
+        (map-get? therapist-ratings therapist)))
+      (patient-history (default-to 
+        {total-ratings-given: u0, average-rating-given: u0, last-rating-block: u0}
+        (map-get? patient-rating-history patient)))
+    )
+    (asserts! (is-eq patient (get patient session)) ERR-NOT-PATIENT)
+    (asserts! (not (is-eq patient therapist)) ERR-CANNOT-RATE-SELF)
+    (asserts! (get completed session) ERR-SESSION-NOT-COMPLETED)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+    (asserts! (is-none existing-rating) ERR-ALREADY-RATED)
+    (var-set next-rating-id (+ rating-id u1))
+    (map-set session-ratings session-id
+      {
+        patient: patient,
+        therapist: therapist,
+        rating: rating,
+        review-text: review-text,
+        timestamp: stacks-block-height,
+        therapist-response: none,
+        response-timestamp: none
+      }
+    )
+    (let
+      (
+        (new-total-ratings (+ (get total-ratings therapist-rating-data) u1))
+        (new-total-score (+ (get total-score therapist-rating-data) rating))
+        (new-average (/ new-total-score new-total-ratings))
+        (updated-star-counts (update-star-count therapist-rating-data rating))
+      )
+      (map-set therapist-ratings therapist
+        (merge updated-star-counts
+          {
+            total-ratings: new-total-ratings,
+            total-score: new-total-score,
+            average-rating: new-average
+          }
+        )
+      )
+    )
+    (map-set patient-rating-history patient
+      {
+        total-ratings-given: (+ (get total-ratings-given patient-history) u1),
+        average-rating-given: (/ (+ (* (get average-rating-given patient-history) (get total-ratings-given patient-history)) rating) (+ (get total-ratings-given patient-history) u1)),
+        last-rating-block: stacks-block-height
+      }
+    )
+    (ok rating-id)
+  )
+)
+
+(define-public (respond-to-rating (session-id uint) (response-text (string-ascii 300)))
+  (let
+    (
+      (therapist tx-sender)
+      (rating (unwrap! (map-get? session-ratings session-id) ERR-NO-RATING))
+    )
+    (asserts! (is-eq therapist (get therapist rating)) ERR-NOT-THERAPIST)
+    (ok (map-set session-ratings session-id
+      (merge rating
+        {
+          therapist-response: (some response-text),
+          response-timestamp: (some stacks-block-height)
+        }
+      )
+    ))
+  )
+)
+
+(define-public (update-rating (session-id uint) (new-rating uint) (new-review-text (string-ascii 500)))
+  (let
+    (
+      (patient tx-sender)
+      (rating (unwrap! (map-get? session-ratings session-id) ERR-NO-RATING))
+      (therapist (get therapist rating))
+      (old-rating-value (get rating rating))
+      (therapist-rating-data (unwrap! (map-get? therapist-ratings therapist) ERR-NO-RATING))
+    )
+    (asserts! (is-eq patient (get patient rating)) ERR-NOT-PATIENT)
+    (asserts! (and (>= new-rating u1) (<= new-rating u5)) ERR-INVALID-RATING)
+    (let
+      (
+        (updated-total-score (+ (- (get total-score therapist-rating-data) old-rating-value) new-rating))
+        (new-average (/ updated-total-score (get total-ratings therapist-rating-data)))
+        (decremented-star-counts (decrement-star-count therapist-rating-data old-rating-value))
+        (updated-star-counts (increment-star-count decremented-star-counts new-rating))
+      )
+      (map-set therapist-ratings therapist
+        (merge updated-star-counts
+          {
+            total-score: updated-total-score,
+            average-rating: new-average
+          }
+        )
+      )
+    )
+    (ok (map-set session-ratings session-id
+      (merge rating
+        {
+          rating: new-rating,
+          review-text: new-review-text,
+          timestamp: stacks-block-height
+        }
+      )
+    ))
+  )
+)
+
+(define-public (flag-inappropriate-review (session-id uint))
+  (let
+    (
+      (caller tx-sender)
+      (rating (unwrap! (map-get? session-ratings session-id) ERR-NO-RATING))
+    )
+    (asserts! (or (is-eq caller (var-get contract-owner)) 
+                  (is-eq caller (get therapist rating))) ERR-NOT-AUTHORIZED)
+    (ok (map-set session-ratings session-id
+      (merge rating { review-text: "Review flagged as inappropriate" })
+    ))
+  )
+)
+
+(define-read-only (get-therapist-rating (therapist principal))
+  (ok (map-get? therapist-ratings therapist))
+)
+
+(define-read-only (get-session-rating (session-id uint))
+  (ok (map-get? session-ratings session-id))
+)
+
+(define-read-only (get-patient-rating-history (patient principal))
+  (ok (map-get? patient-rating-history patient))
+)
+
+(define-read-only (get-therapist-rating-breakdown (therapist principal))
+  (let
+    (
+      (rating-data (map-get? therapist-ratings therapist))
+    )
+    (match rating-data
+      data (ok (some {
+        average-rating: (get average-rating data),
+        total-ratings: (get total-ratings data),
+        rating-distribution: {
+          five-star: (get five-star data),
+          four-star: (get four-star data),
+          three-star: (get three-star data),
+          two-star: (get two-star data),
+          one-star: (get one-star data)
+        }
+      }))
+      (ok none)
+    )
+  )
+)
+
+(define-read-only (get-recent-reviews (therapist principal) (limit uint))
+  (ok (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
+)
+
+(define-private (update-star-count (rating-data (tuple (total-ratings uint) (total-score uint) (average-rating uint) (five-star uint) (four-star uint) (three-star uint) (two-star uint) (one-star uint))) (rating uint))
+  (if (is-eq rating u5)
+    (merge rating-data { five-star: (+ (get five-star rating-data) u1) })
+    (if (is-eq rating u4)
+      (merge rating-data { four-star: (+ (get four-star rating-data) u1) })
+      (if (is-eq rating u3)
+        (merge rating-data { three-star: (+ (get three-star rating-data) u1) })
+        (if (is-eq rating u2)
+          (merge rating-data { two-star: (+ (get two-star rating-data) u1) })
+          (merge rating-data { one-star: (+ (get one-star rating-data) u1) })
+        )
+      )
+    )
+  )
+)
+
+(define-private (increment-star-count (rating-data (tuple (total-ratings uint) (total-score uint) (average-rating uint) (five-star uint) (four-star uint) (three-star uint) (two-star uint) (one-star uint))) (rating uint))
+  (if (is-eq rating u5)
+    (merge rating-data { five-star: (+ (get five-star rating-data) u1) })
+    (if (is-eq rating u4)
+      (merge rating-data { four-star: (+ (get four-star rating-data) u1) })
+      (if (is-eq rating u3)
+        (merge rating-data { three-star: (+ (get three-star rating-data) u1) })
+        (if (is-eq rating u2)
+          (merge rating-data { two-star: (+ (get two-star rating-data) u1) })
+          (merge rating-data { one-star: (+ (get one-star rating-data) u1) })
+        )
+      )
+    )
+  )
+)
+
+(define-private (decrement-star-count (rating-data (tuple (total-ratings uint) (total-score uint) (average-rating uint) (five-star uint) (four-star uint) (three-star uint) (two-star uint) (one-star uint))) (rating uint))
+  (if (is-eq rating u5)
+    (merge rating-data { five-star: (- (get five-star rating-data) u1) })
+    (if (is-eq rating u4)
+      (merge rating-data { four-star: (- (get four-star rating-data) u1) })
+      (if (is-eq rating u3)
+        (merge rating-data { three-star: (- (get three-star rating-data) u1) })
+        (if (is-eq rating u2)
+          (merge rating-data { two-star: (- (get two-star rating-data) u1) })
+          (merge rating-data { one-star: (- (get one-star rating-data) u1) })
+        )
+      )
+    )
+  )
+)
+
+
